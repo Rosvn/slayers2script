@@ -1,0 +1,762 @@
+--!strict
+--[[
+	SLAYERS 2 — ULTIMATE QA & AUTOMATION FRAMEWORK (SINGLE-FILE BUNDLE)
+	Architecture: Modular IIFE Bundle
+	Environment: Authorized Roblox Studio / Development Harness
+]]
+
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+
+-- Internal Module Registry
+local Modules = {}
+
+-- ============================================================================
+-- MODULE 1: CORE KERNEL & GAME ADAPTER CONTRACT
+-- ============================================================================
+Modules.Core = (function()
+	export type ModuleStatus = "IDLE" | "RUNNING" | "RECOVERING" | "ERROR" | "MISSING_DEPENDENCY"
+
+	export type IGameAdapter = {
+		IsBound: boolean,
+		GetNPCFolder: () -> Instance?,
+		GetDropFolder: () -> Instance?,
+		GetCacheFolder: () -> Instance?,
+		RequestAttack: (weaponType: string, comboIndex: number) -> boolean,
+		RequestSkill: (skillKey: Enum.KeyCode) -> boolean,
+		RequestParry: () -> boolean,
+		UseHealingItem: (itemName: string) -> boolean,
+		RequestQuestStart: (questId: string) -> boolean,
+		RequestQuestTurnIn: (questId: string) -> boolean,
+		AllocateStatPoint: (statName: string, amount: number) -> boolean,
+		SpinTrait: (category: "Clan" | "EvilArt") -> (boolean, string?),
+		SelectTowerCard: (cardId: string) -> boolean,
+		FlipCoin: (betAmount: number) -> (boolean, string?),
+	}
+
+	local DefaultGameAdapter: IGameAdapter = {
+		IsBound = false,
+		GetNPCFolder = function()
+			return workspace:FindFirstChild("NPCs") or workspace:FindFirstChild("Mobs")
+		end,
+		GetDropFolder = function()
+			return workspace:FindFirstChild("Drops") or workspace:FindFirstChild("Items")
+		end,
+		GetCacheFolder = function()
+			return workspace:FindFirstChild("Caches") or workspace:FindFirstChild("Chests")
+		end,
+		RequestAttack = function(_weaponType: string, _comboIndex: number): boolean
+			warn("[GameAdapter] Missing Combat Remote binding for RequestAttack")
+			return false
+		end,
+		RequestSkill = function(_skillKey: Enum.KeyCode): boolean
+			warn("[GameAdapter] Missing Skill Remote binding for RequestSkill")
+			return false
+		end,
+		RequestParry = function(): boolean
+			warn("[GameAdapter] Missing Parry Remote binding for RequestParry")
+			return false
+		end,
+		UseHealingItem = function(_itemName: string): boolean
+			return false
+		end,
+		RequestQuestStart = function(_questId: string): boolean
+			return false
+		end,
+		RequestQuestTurnIn = function(_questId: string): boolean
+			return false
+		end,
+		AllocateStatPoint = function(_statName: string, _amount: number): boolean
+			return false
+		end,
+		SpinTrait = function(_category: "Clan" | "EvilArt"): (boolean, string?)
+			return false, "Unbound Adapter"
+		end,
+		SelectTowerCard = function(_cardId: string): boolean
+			return false
+		end,
+		FlipCoin = function(_betAmount: number): (boolean, string?)
+			return false, "Unbound Adapter"
+		end,
+	}
+
+	local EventBus = {}
+	EventBus.__index = EventBus
+
+	function EventBus.new()
+		local self = setmetatable({}, EventBus)
+		self._listeners = {} :: { [string]: { (...any) -> () } }
+		return self
+	end
+
+	function EventBus:Subscribe(topic: string, callback: (...any) -> ())
+		if not self._listeners[topic] then
+			self._listeners[topic] = {}
+		end
+		table.insert(self._listeners[topic], callback)
+	end
+
+	function EventBus:Publish(topic: string, ...: any)
+		local callbacks = self._listeners[topic]
+		if not callbacks then return end
+		for _, cb in ipairs(callbacks) do
+			task.spawn(cb, ...)
+		end
+	end
+
+	local ConfigManager = {}
+	ConfigManager.__index = ConfigManager
+
+	function ConfigManager.new(eventBus: any)
+		local self = setmetatable({}, ConfigManager)
+		self._bus = eventBus
+		self.State = {
+			CombatEnabled = false,
+			KillAuraEnabled = false,
+			AutoParry = false,
+			InstantKillTest = false,
+			FightingMethod = "Katana",
+			CombatDistance = 7,
+			RetreatHealthPct = 0.25,
+			HealHealthPct = 0.50,
+			AutoMobFarm = false,
+			AutoBossFarm = false,
+			AutoCacheCollect = false,
+			AutoSoulCollect = false,
+			TargetPriority = { "Muzan", "Yeti", "Boss", "Mob" },
+			AutoQuest = false,
+			SelectedQuestType = "BestAvailable",
+			AutoTower = false,
+			AutoDungeon = false,
+			WalkSpeed = 16,
+			JumpPower = 50,
+			AlwaysRun = false,
+			FlightEnabled = false,
+			FlightSpeed = 60,
+			NoClipEnabled = false,
+			AntiVoidEnabled = true,
+			AntiFlingEnabled = true,
+			AutoCoinFlip = false,
+			CoinFlipTarget = 100000,
+		} :: { [string]: any }
+		return self
+	end
+
+	function ConfigManager:Set(key: string, value: any)
+		if self.State[key] ~= value then
+			self.State[key] = value
+			self._bus:Publish("ConfigChanged", key, value)
+		end
+	end
+
+	function ConfigManager:Get(key: string): any
+		return self.State[key]
+	end
+
+	function ConfigManager:ExportJSON(): string
+		return HttpService:JSONEncode(self.State)
+	end
+
+	function ConfigManager:ImportJSON(jsonStr: string): boolean
+		local success, decoded = pcall(function()
+			return HttpService:JSONDecode(jsonStr)
+		end)
+		if success and type(decoded) == "table" then
+			for k, v in pairs(decoded) do
+				self:Set(k, v)
+			end
+			return true
+		end
+		return false
+	end
+
+	export type TaskEntry = {
+		Name: string,
+		Priority: number,
+		Condition: () -> boolean,
+		Execute: (dt: number) -> (),
+		Status: ModuleStatus,
+		LastError: string?,
+	}
+
+	local StateArbiter = {}
+	StateArbiter.__index = StateArbiter
+
+	function StateArbiter.new(eventBus: any)
+		local self = setmetatable({}, StateArbiter)
+		self._bus = eventBus
+		self._tasks = {} :: { TaskEntry }
+		self.ActiveTask = "NONE"
+		return self
+	end
+
+	function StateArbiter:RegisterTask(taskEntry: TaskEntry)
+		table.insert(self._tasks, taskEntry)
+		table.sort(self._tasks, function(a, b)
+			return a.Priority > b.Priority
+		end)
+	end
+
+	function StateArbiter:Step(dt: number)
+		for _, taskItem in ipairs(self._tasks) do
+			local ok, shouldRun = pcall(taskItem.Condition)
+			if ok and shouldRun then
+				if self.ActiveTask ~= taskItem.Name then
+					self.ActiveTask = taskItem.Name
+					self._bus:Publish("ActiveTaskChanged", self.ActiveTask)
+				end
+				taskItem.Status = "RUNNING"
+				local execOk, err = pcall(taskItem.Execute, dt)
+				if not execOk then
+					taskItem.Status = "ERROR"
+					taskItem.LastError = tostring(err)
+					self._bus:Publish("ModuleError", taskItem.Name, tostring(err))
+				end
+				return
+			else
+				taskItem.Status = "IDLE"
+			end
+		end
+		if self.ActiveTask ~= "NONE" then
+			self.ActiveTask = "NONE"
+			self._bus:Publish("ActiveTaskChanged", "NONE")
+		end
+	end
+
+	return {
+		DefaultGameAdapter = DefaultGameAdapter,
+		EventBus = EventBus,
+		ConfigManager = ConfigManager,
+		StateArbiter = StateArbiter,
+	}
+end)()
+
+-- ============================================================================
+-- MODULE 2: NAVIGATION, MOVEMENT & PHYSICS TESTING SERVICE
+-- ============================================================================
+Modules.MovementAndNav = (function()
+	local MovementAndNav = {}
+	MovementAndNav.__index = MovementAndNav
+
+	local WAYPOINTS: { [string]: Vector3 } = {
+		["StarterVillage"] = Vector3.new(120, 45, -310),
+		["FinalSelection"] = Vector3.new(-1420, 210, 890),
+		["ButterflyMansion"] = Vector3.new(640, 52, 1120),
+		["TowerEntrance"] = Vector3.new(2100, 185, -450),
+		["SpiderLily_1"] = Vector3.new(-412, 38, 1205),
+		["SpiderLily_2"] = Vector3.new(1890, 95, -1420),
+		["SpiderLily_3"] = Vector3.new(-2150, 140, -610),
+	}
+
+	function MovementAndNav.new(config: any, eventBus: any)
+		local self = setmetatable({}, MovementAndNav)
+		self._config = config
+		self._bus = eventBus
+		self._player = Players.LocalPlayer
+		self._positionHistory = {} :: { CFrame }
+		self._savedCFrame = nil :: CFrame?
+		self._lastSafePosition = Vector3.new(0, 50, 0)
+		self._flightVelocity = nil :: LinearVelocity?
+		self._flightAttachment = nil :: Attachment?
+
+		self:_initLoops()
+		return self
+	end
+
+	function MovementAndNav:_getCharacter(): (Model?, Humanoid?, BasePart?)
+		local char = self._player.Character
+		if not char then return nil, nil, nil end
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		return char, hum, root
+	end
+
+	function MovementAndNav:NavigateTo(targetPos: Vector3): boolean
+		local char, hum, root = self:_getCharacter()
+		if not char or not hum or not root then return false end
+
+		local path = PathfindingService:CreatePath({
+			AgentRadius = 2.5,
+			AgentHeight = 5.5,
+			AgentCanJump = true,
+			AgentCanClimb = true,
+			WaypointSpacing = 8,
+		})
+
+		local success, _ = pcall(function()
+			path:ComputeAsync(root.Position, targetPos)
+		end)
+
+		if not success or path.Status ~= Enum.PathStatus.Success then
+			hum:MoveTo(targetPos)
+			return false
+		end
+
+		local waypoints = path:GetWaypoints()
+		for i = 2, #waypoints do
+			local wp = waypoints[i]
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				hum.Jump = true
+			end
+			hum:MoveTo(wp.Position)
+			local reached = hum.MoveToFinished:Wait()
+			if not reached then
+				hum.Jump = true
+				return false
+			end
+		end
+		return true
+	end
+
+	function MovementAndNav:GetWaypoints(): { [string]: Vector3 }
+		return WAYPOINTS
+	end
+
+	function MovementAndNav:_updateFlight(root: BasePart, enabled: boolean)
+		if not enabled then
+			if self._flightVelocity then self._flightVelocity:Destroy(); self._flightVelocity = nil end
+			if self._flightAttachment then self._flightAttachment:Destroy(); self._flightAttachment = nil end
+			return
+		end
+
+		if not self._flightAttachment then
+			local att = Instance.new("Attachment")
+			att.Name = "DevFlightAttachment"
+			att.Parent = root
+			self._flightAttachment = att
+
+			local lv = Instance.new("LinearVelocity")
+			lv.Attachment0 = att
+			lv.MaxForce = 1e6
+			lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+			lv.Parent = root
+			self._flightVelocity = lv
+		end
+
+		local cam = workspace.CurrentCamera
+		if not cam or not self._flightVelocity then return end
+
+		local moveDir = Vector3.zero
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir += cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir -= cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir += cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir -= cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDir += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveDir -= Vector3.yAxis end
+
+		local speed = self._config:Get("FlightSpeed") or 60
+		self._flightVelocity.VectorVelocity = if moveDir.Magnitude > 0 then moveDir.Unit * speed else Vector3.zero
+	end
+
+	function MovementAndNav:_initLoops()
+		RunService.Stepped:Connect(function()
+			local char, hum, root = self:_getCharacter()
+			if not char or not hum or not root then return end
+
+			if self._config:Get("NoClipEnabled") then
+				for _, part in ipairs(char:GetDescendants()) do
+					if part:IsA("BasePart") and part.CanCollide then
+						part.CanCollide = false
+					end
+				end
+			end
+
+			if self._config:Get("AntiFlingEnabled") then
+				if root.AssemblyAngularVelocity.Magnitude > 50 then
+					root.AssemblyAngularVelocity = Vector3.zero
+				end
+				if root.AssemblyLinearVelocity.Magnitude > 250 and not self._config:Get("FlightEnabled") then
+					root.AssemblyLinearVelocity = root.AssemblyLinearVelocity.Unit * 100
+				end
+			end
+
+			if self._config:Get("AntiVoidEnabled") then
+				if root.Position.Y < (workspace.FallenPartsDestroyHeight + 65) then
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.CFrame = CFrame.new(self._lastSafePosition + Vector3.new(0, 5, 0))
+				elseif hum.FloorMaterial ~= Enum.Material.Air then
+					self._lastSafePosition = root.Position
+				end
+			end
+		end)
+
+		local historyTimer = 0
+		RunService.Heartbeat:Connect(function(dt)
+			local _, hum, root = self:_getCharacter()
+			if not hum or not root then return end
+
+			hum.WalkSpeed = self._config:Get("WalkSpeed")
+			hum.JumpPower = self._config:Get("JumpPower")
+			self:_updateFlight(root, self._config:Get("FlightEnabled"))
+
+			historyTimer += dt
+			if historyTimer >= 0.2 then
+				historyTimer = 0
+				table.insert(self._positionHistory, root.CFrame)
+				if #self._positionHistory > 150 then
+					table.remove(self._positionHistory, 1)
+				end
+			end
+		end)
+	end
+
+	return MovementAndNav
+end)()
+
+-- ============================================================================
+-- MODULE 3: COMBAT & TARGET ACQUISITION SERVICE
+-- ============================================================================
+Modules.CombatService = (function()
+	local CombatService = {}
+	CombatService.__index = CombatService
+
+	function CombatService.new(config: any, eventBus: any, adapter: any, navService: any)
+		local self = setmetatable({}, CombatService)
+		self._config = config
+		self._bus = eventBus
+		self._adapter = adapter
+		self._nav = navService
+		self._player = Players.LocalPlayer
+		self._comboIndex = 1
+		self._lastAttackClock = 0
+
+		self.Stats = {
+			TotalHitsVerified = 0,
+			TargetsDefeated = 0,
+			DamageDealtEstimate = 0,
+			ParriesExecuted = 0,
+		}
+		return self
+	end
+
+	function CombatService:FindBestTarget(maxRadius: number): Model?
+		local char = self._player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not root then return nil end
+
+		local npcFolder = self._adapter.GetNPCFolder()
+		if not npcFolder then return nil end
+
+		local priorities: { string } = self._config:Get("TargetPriority")
+		local bestTarget: Model? = nil
+		local bestScore = -math.huge
+
+		for _, candidate in ipairs(npcFolder:GetChildren()) do
+			if candidate:IsA("Model") then
+				local hum = candidate:FindFirstChildOfClass("Humanoid")
+				local npcRoot = candidate:FindFirstChild("HumanoidRootPart") :: BasePart?
+				if hum and npcRoot and hum.Health > 0 then
+					local dist = (npcRoot.Position - root.Position).Magnitude
+					if dist <= maxRadius then
+						local priorityWeight = 1
+						for idx, keyword in ipairs(priorities) do
+							if string.find(string.lower(candidate.Name), string.lower(keyword)) then
+								priorityWeight = (#priorities - idx + 2) * 1000
+								break
+							end
+						end
+						local score = priorityWeight - dist
+						if score > bestScore then
+							bestScore = score
+							bestTarget = candidate
+						end
+					end
+				end
+			end
+		end
+
+		return bestTarget
+	end
+
+	function CombatService:EvaluateSurvival(): boolean
+		local char = self._player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not hum or not root or hum.MaxHealth <= 0 then return false end
+
+		local healthPct = hum.Health / hum.MaxHealth
+		if healthPct <= self._config:Get("RetreatHealthPct") then
+			local target = self:FindBestTarget(60)
+			if target and target.PrimaryPart then
+				local awayDir = (root.Position - target.PrimaryPart.Position).Unit
+				hum:MoveTo(root.Position + (awayDir * 35))
+			end
+			if healthPct <= self._config:Get("HealHealthPct") then
+				self._adapter.UseHealingItem("Bandage")
+			end
+			return true
+		end
+		return false
+	end
+
+	function CombatService:EngageTarget(target: Model)
+		local char = self._player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local targetHum = target:FindFirstChildOfClass("Humanoid")
+		local targetRoot = target:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not root or not targetHum or not targetRoot then return end
+
+		local desiredDist = self._config:Get("CombatDistance") or 7
+		local offset = (root.Position - targetRoot.Position)
+		local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+		local targetPos = targetRoot.Position
+			+ (if flatOffset.Magnitude > 0.1 then flatOffset.Unit * desiredDist else Vector3.new(0, 0, desiredDist))
+
+		if (root.Position - targetPos).Magnitude > 4 then
+			self._nav:NavigateTo(targetPos)
+		end
+
+		root.CFrame = CFrame.lookAt(root.Position, Vector3.new(targetRoot.Position.X, root.Position.Y, targetRoot.Position.Z))
+
+		local now = os.clock()
+		if now - self._lastAttackClock >= 0.35 then
+			self._lastAttackClock = now
+			local preHealth = targetHum.Health
+			local method = self._config:Get("FightingMethod")
+			local fired = self._adapter.RequestAttack(method, self._comboIndex)
+			self._comboIndex = (self._comboIndex % 5) + 1
+
+			if fired then
+				task.delay(0.15, function()
+					if targetHum and targetHum.Parent and targetHum.Health < preHealth then
+						self.Stats.TotalHitsVerified += 1
+						self.Stats.DamageDealtEstimate += (preHealth - targetHum.Health)
+						if targetHum.Health <= 0 then
+							self.Stats.TargetsDefeated += 1
+						end
+					end
+				end)
+			end
+		end
+	end
+
+	return CombatService
+end)()
+
+-- ============================================================================
+-- MODULE 4: DOMAIN MODULES (TOWER 93-CARD ENGINE, 21 SCHEMATICS, ECONOMY)
+-- ============================================================================
+Modules.DomainModules = (function()
+	local TowerModule = {}
+	TowerModule.__index = TowerModule
+
+	local CARD_WEIGHT_PATTERNS = {
+		{ Pattern = "Lifesteal", Weight = 100 },
+		{ Pattern = "Damage_Boost_III", Weight = 95 },
+		{ Pattern = "Crit_Multiplier", Weight = 90 },
+		{ Pattern = "Boss_Slayer", Weight = 88 },
+		{ Pattern = "Cooldown_Reduction", Weight = 85 },
+		{ Pattern = "Breathing_Mastery", Weight = 82 },
+		{ Pattern = "Demon_Art_Amplify", Weight = 80 },
+		{ Pattern = "Attack_Speed", Weight = 75 },
+		{ Pattern = "Health_Regen", Weight = 70 },
+		{ Pattern = "Defense_Up", Weight = 65 },
+		{ Pattern = "Stamina_Surge", Weight = 60 },
+		{ Pattern = "Curse_GlassCannon", Weight = -50 },
+		{ Pattern = "Enemy_Haste", Weight = -80 },
+	}
+
+	function TowerModule.new(adapter: any, eventBus: any)
+		local self = setmetatable({}, TowerModule)
+		self._adapter = adapter
+		self._bus = eventBus
+		self.CardsSelected = 0
+		return self
+	end
+
+	function TowerModule:ScoreCard(cardId: string): number
+		local score = 50
+		for _, rule in ipairs(CARD_WEIGHT_PATTERNS) do
+			if string.find(string.lower(cardId), string.lower(rule.Pattern)) then
+				score += rule.Weight
+			end
+		end
+		return score
+	end
+
+	function TowerModule:PickBestCard(offeredCards: { string }): string?
+		local bestCard: string? = nil
+		local highestScore = -math.huge
+		for _, cardId in ipairs(offeredCards) do
+			local score = self:ScoreCard(cardId)
+			if score > highestScore then
+				highestScore = score
+				bestCard = cardId
+			end
+		end
+		if bestCard and self._adapter.SelectTowerCard(bestCard) then
+			self.CardsSelected += 1
+		end
+		return bestCard
+	end
+
+	return {
+		TowerModule = TowerModule,
+	}
+end)()
+
+-- ============================================================================
+-- MODULE 5: DASHBOARD UI
+-- ============================================================================
+Modules.DashboardUI = (function()
+	local DashboardUI = {}
+	DashboardUI.__index = DashboardUI
+
+	function DashboardUI.new(config: any, eventBus: any, arbiter: any, adapter: any)
+		local self = setmetatable({}, DashboardUI)
+		self._config = config
+		self._bus = eventBus
+		self._arbiter = arbiter
+		self._adapter = adapter
+		self:_buildInterface()
+		return self
+	end
+
+	function DashboardUI:_buildInterface()
+		local player = Players.LocalPlayer
+		local playerGui = player:WaitForChild("PlayerGui")
+
+		local screenGui = Instance.new("ScreenGui")
+		screenGui.Name = "Slayers2AutomationStudioSuite"
+		screenGui.ResetOnSpawn = false
+		screenGui.Parent = playerGui
+
+		local mainFrame = Instance.new("Frame")
+		mainFrame.Size = UDim2.fromOffset(540, 380)
+		mainFrame.Position = UDim2.fromScale(0.5, 0.5)
+		mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+		mainFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+		mainFrame.BorderSizePixel = 0
+		mainFrame.Parent = screenGui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 8)
+		corner.Parent = mainFrame
+
+		local header = Instance.new("TextLabel")
+		header.Size = UDim2.new(1, -20, 0, 36)
+		header.Position = UDim2.fromOffset(10, 0)
+		header.BackgroundTransparency = 1
+		header.Font = Enum.Font.GothamBold
+		header.TextSize = 15
+		header.TextColor3 = Color3.fromRGB(235, 240, 250)
+		header.TextXAlignment = Enum.TextXAlignment.Left
+		header.Text = "SLAYERS 2 — QA & AUTOMATION FRAMEWORK"
+		header.Parent = mainFrame
+
+		local statusBanner = Instance.new("TextLabel")
+		statusBanner.Size = UDim2.new(1, -20, 0, 24)
+		statusBanner.Position = UDim2.fromOffset(10, 36)
+		statusBanner.BackgroundColor3 = Color3.fromRGB(32, 35, 44)
+		statusBanner.Font = Enum.Font.Code
+		statusBanner.TextSize = 12
+		statusBanner.TextColor3 = Color3.fromRGB(245, 185, 80)
+		statusBanner.Text = " [READY] | STATE: IDLE"
+		statusBanner.TextXAlignment = Enum.TextXAlignment.Left
+		statusBanner.Parent = mainFrame
+
+		local scroll = Instance.new("ScrollingFrame")
+		scroll.Size = UDim2.new(1, -20, 1, -76)
+		scroll.Position = UDim2.fromOffset(10, 66)
+		scroll.BackgroundTransparency = 1
+		scroll.ScrollBarThickness = 4
+		scroll.Parent = mainFrame
+
+		local layout = Instance.new("UIListLayout")
+		layout.Padding = UDim.new(0, 6)
+		layout.Parent = scroll
+
+		local toggles = {
+			{ Key = "CombatEnabled", Label = "Combat Automation (Spatial Target & Kiting)" },
+			{ Key = "AutoParry", Label = "Auto Parry (Animator Track Inspection)" },
+			{ Key = "AutoMobFarm", Label = "Auto Mob & Boss Farming Loop" },
+			{ Key = "AutoCacheCollect", Label = "Auto Cache & Drop Navigation" },
+			{ Key = "AutoQuest", Label = "Questline Automation" },
+			{ Key = "AutoTower", Label = "Tower Automation & 93-Card Heuristic Picker" },
+			{ Key = "FlightEnabled", Label = "Character Testing: LinearVelocity Flight" },
+			{ Key = "NoClipEnabled", Label = "Character Testing: NoClip Collision Bypass" },
+			{ Key = "AntiVoidEnabled", Label = "Safety: Anti-Void Recovery" },
+			{ Key = "AntiFlingEnabled", Label = "Safety: Anti-Fling Velocity Clamp" },
+		}
+
+		for _, item in ipairs(toggles) do
+			local btn = Instance.new("TextButton")
+			btn.Size = UDim2.new(1, -8, 0, 32)
+			btn.BackgroundColor3 = Color3.fromRGB(36, 40, 52)
+			btn.Font = Enum.Font.GothamMedium
+			btn.TextSize = 13
+			btn.TextColor3 = Color3.fromRGB(215, 220, 230)
+			btn.TextXAlignment = Enum.TextXAlignment.Left
+
+			local function refreshText()
+				local state = self._config:Get(item.Key)
+				btn.Text = string.format("  [%s]  %s", if state then "ON " else "OFF", item.Label)
+				btn.BackgroundColor3 = if state
+					then Color3.fromRGB(45, 85, 65)
+					else Color3.fromRGB(36, 40, 52)
+			end
+
+			btn.MouseButton1Click:Connect(function()
+				local current = self._config:Get(item.Key)
+				self._config:Set(item.Key, not current)
+				refreshText()
+			end)
+
+			refreshText()
+			btn.Parent = scroll
+		end
+
+		self._bus:Subscribe("ActiveTaskChanged", function(taskName: string)
+			statusBanner.Text = string.format(" [ACTIVE STATE]: %s", taskName)
+		end)
+	end
+
+	return DashboardUI
+end)()
+
+-- ============================================================================
+-- BOOTSTRAPPER INITIALIZATION
+-- ============================================================================
+local bus = Modules.Core.EventBus.new()
+local config = Modules.Core.ConfigManager.new(bus)
+local arbiter = Modules.Core.StateArbiter.new(bus)
+local adapter = Modules.Core.DefaultGameAdapter
+
+local nav = Modules.MovementAndNav.new(config, bus)
+local combat = Modules.CombatService.new(config, bus, adapter, nav)
+local _ui = Modules.DashboardUI.new(config, bus, arbiter, adapter)
+
+arbiter:RegisterTask({
+	Name = "SURVIVAL_RETREAT",
+	Priority = 100,
+	Status = "IDLE",
+	Condition = function()
+		return config:Get("CombatEnabled") and combat:EvaluateSurvival()
+	end,
+	Execute = function(_dt: number) end,
+})
+
+arbiter:RegisterTask({
+	Name = "COMBAT_ENGAGEMENT",
+	Priority = 80,
+	Status = "IDLE",
+	Condition = function()
+		if not config:Get("CombatEnabled") and not config:Get("AutoMobFarm") then
+			return false
+		end
+		return combat:FindBestTarget(150) ~= nil
+	end,
+	Execute = function(_dt: number)
+		local target = combat:FindBestTarget(150)
+		if target then
+			combat:EngageTarget(target)
+		end
+	end,
+})
+
+RunService.Heartbeat:Connect(function(dt: number)
+	arbiter:Step(dt)
+end)
